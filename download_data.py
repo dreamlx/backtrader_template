@@ -123,6 +123,10 @@ class BinanceDataDownloader:
             with ZipFile(zip_path) as zf:
                 # Get the CSV filename from the zip
                 csv_name = next(name for name in zf.namelist() if name.endswith('.csv'))
+                
+                # Extract period from filename (e.g., "BTCUSDT-1m-2017-08.zip" -> "1m")
+                period = re.search(r'-(\w+)-\d{4}', zip_path.name).group(1)
+                
                 with zf.open(csv_name) as csv_file:
                     df = pd.read_csv(
                         csv_file,
@@ -130,6 +134,13 @@ class BinanceDataDownloader:
                         names=self.config.columns
                     )
                     
+            # 过滤掉可能的标题行（有些文件可能包含'open'作为值）
+            df = df[df['Open'] != 'open']
+            
+            # 确保时间戳列是数值类型，然后再转换为datetime
+            df['Open time'] = pd.to_numeric(df['Open time'], errors='coerce')
+            df['Close time'] = pd.to_numeric(df['Close time'], errors='coerce')
+            
             # Basic data validation
             self._validate_klines_data(df, period)
             
@@ -175,6 +186,11 @@ class BinanceDataDownloader:
 
         # 检查时间序列的连续性
         if period in self.config.expected_timeframe:
+            # 确保数据已转换为数值类型
+            if not pd.api.types.is_numeric_dtype(df['Open time']):
+                # 如果还没有转换为datetime，先转换
+                df['Open time'] = pd.to_datetime(df['Open time'], unit='ms')
+                
             expected_interval = self.config.expected_timeframe[period]
             time_diffs = df['Open time'].diff()
             invalid_intervals = time_diffs[time_diffs != expected_interval]
@@ -188,6 +204,10 @@ class BinanceDataDownloader:
         # 检查价格数据的合理性
         price_cols = ['Open', 'High', 'Low', 'Close']
         for col in price_cols:
+            # 确保数据已转换为数值类型
+            if not pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                
             if (df[col] <= 0).any():
                 self.logger.warning(f"Found non-positive values in {col} column")
             
@@ -267,6 +287,43 @@ class BinanceDataDownloader:
         except Exception as e:
             self.logger.error(f"Error verifying data integrity: {str(e)}")
             return False
+
+    def download_spot_klines_range(self, symbol: str, period: str, start: datetime, end: datetime) -> bool:
+        """
+        下载指定时间范围的币安现货K线历史行情数据
+        
+        Args:
+            symbol: 交易对
+            period: 时间周期，比如：1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1mo
+            start: 开始日期
+            end: 结束日期
+            
+        Returns:
+            bool: 是否全部下载成功
+        """
+        current_date = start
+        success_count = 0
+        total_months = 0
+        
+        while current_date <= end:
+            total_months += 1
+            path = self.config.data_path / symbol / period / f"{symbol}-{period}-{current_date.year}-{current_date.month:02d}.zip"
+            
+            if not path.exists():
+                self.logger.info(f"Downloading {symbol}-{period} for {current_date.year}-{current_date.month:02d}")
+                if self.download_spot_klines(symbol, period, current_date, path):
+                    success_count += 1
+                    time.sleep(2)  # 避免请求过于频繁
+                else:
+                    self.logger.error(f"Failed to download {path}")
+            else:
+                self.logger.info(f"File already exists: {path}")
+                success_count += 1
+                
+            current_date += relativedelta(months=1)
+            
+        self.logger.info(f"Downloaded {success_count}/{total_months} files for {symbol}-{period}")
+        return success_count == total_months
 
 def download_spot_klines_range(symbol, period, start: datetime, end: datetime, dir=''):
     """
@@ -378,6 +435,8 @@ def main():
                        help='Path to store downloaded data')
     parser.add_argument('--verify-only', action='store_true',
                        help='Only verify existing data without downloading')
+    parser.add_argument('--merge-only', action='store_true',
+                       help='Only merge existing data without downloading')
     
     args = parser.parse_args()
     
@@ -402,20 +461,28 @@ def main():
             else:
                 print(f"Data integrity check failed for {symbol}-{period}")
             continue
+            
+        if args.merge_only:
+            try:
+                output_path = config.data_path / symbol / f"{symbol}-{period}.csv"
+                print(f"Merging data for {symbol}-{period} to {output_path}...")
+                downloader.merge_klines_files(symbol, period, output_path)
+                print(f"Successfully merged data for {symbol}-{period}")
+            except Exception as e:
+                print(f"Error merging data for {symbol}-{period}: {str(e)}")
+            continue
         
         # Download data
-        current_date = start_date
-        while current_date <= end_date:
-            path = config.data_path / symbol / period / f"{symbol}-{period}-{current_date.year}-{current_date.month:02d}.zip"
-            if not path.exists():
-                success = downloader.download_spot_klines(symbol, period, current_date, path)
-                if success:
-                    time.sleep(2)  # Rate limiting
-            current_date += relativedelta(months=1)
+        print(f"Downloading data for {symbol}-{period} from {args.start_date} to {args.end_date}...")
+        if downloader.download_spot_klines_range(symbol, period, start_date, end_date):
+            print(f"Successfully downloaded all data for {symbol}-{period}")
+        else:
+            print(f"Some files could not be downloaded for {symbol}-{period}")
         
         # Merge and verify downloaded data
         try:
             output_path = config.data_path / symbol / f"{symbol}-{period}.csv"
+            print(f"Merging data for {symbol}-{period}...")
             merged_df = downloader.merge_klines_files(symbol, period, output_path)
             print(f"Successfully merged data for {symbol}-{period}")
             
